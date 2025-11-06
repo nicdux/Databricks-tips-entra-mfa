@@ -1,0 +1,188 @@
+{
+  "displayName": "MFA-Obrigatório-Azure-Databricks",
+  "state": "enabledForReportingButNotEnforced",
+  "conditions": {
+    "applications": {
+      "includeApplications": [
+        "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
+      ],
+      "excludeApplications": [],
+      "includeUserActions": []
+    },
+    "users": {
+      "includeUsers": [
+        "All"
+      ],
+      "excludeUsers": [],
+      "includeGroups": [],
+      "excludeGroups": [
+        "<ID-DO-GRUPO-BREAK-GLASS>"
+      ],
+      "includeRoles": [],
+      "excludeRoles": []
+    },
+    "platforms": {
+      "includePlatforms": [
+        "all"
+      ],
+      "excludePlatforms": []
+    },
+    "locations": {
+      "includeLocations": [
+        "All"
+      ],
+      "excludeLocations": []
+    },
+    "clientAppTypes": [
+      "all"
+    ],
+    "signInRiskLevels": [],
+    "userRiskLevels": []
+  },
+  "grantControls": {
+    "operator": "AND",
+    "builtInControls": [
+      "mfa"
+    ],
+    "customAuthenticationFactors": [],
+    "termsOfUse": []
+  },
+  "sessionControls": {
+    "signInFrequency": {
+      "value": 8,
+      "type": "hours",
+      "isEnabled": true
+    },
+    "persistentBrowser": {
+      "mode": "always",
+      "isEnabled": true
+    },
+    "applicationEnforcedRestrictions": null,
+    "cloudAppSecurity": null
+  },
+  "_metadata": {
+    "version": "1.0",
+    "description": "Template de política de Acesso Condicional para exigir MFA no Azure Databricks",
+    "author": "Databricks MFA Playbook",
+    "lastUpdated": "2025-11-06",
+    "usage": {
+      "step1": "Crie um grupo de exclusão para contas break-glass",
+      "step2": "Substitua <ID-DO-GRUPO-BREAK-GLASS> pelo ObjectId do grupo",
+      "step3": "Importe esta política no Microsoft Entra ID",
+      "step4": "Teste em modo 'Somente relatório' primeiro",
+      "step5": "Após validação, altere state para 'enabled'"
+    },
+    "notes": {
+      "state": "Comece com 'enabledForReportingButNotEnforced' para testar sem impacto",
+      "users": "Sempre exclua conta(s) break-glass para evitar bloqueio total",
+      "sessionControls": "8 horas de frequência de login equilibra segurança e experiência do usuário",
+      "customizations": [
+        "Ajuste signInFrequency conforme política de segurança da empresa",
+        "Considere adicionar 'compliantDevice' aos grantControls para maior segurança",
+        "Pode adicionar filtros de localização se acesso for restrito geograficamente"
+      ]
+    }
+  },
+  "examples": {
+    "basic": {
+      "description": "Configuração básica: MFA para todos os usuários",
+      "conditions": {
+        "users": {
+          "includeUsers": ["All"],
+          "excludeGroups": ["<BREAK-GLASS-GROUP-ID>"]
+        }
+      },
+      "grantControls": {
+        "operator": "AND",
+        "builtInControls": ["mfa"]
+      }
+    },
+    "withCompliantDevice": {
+      "description": "MFA + Dispositivo gerenciado (maior segurança)",
+      "grantControls": {
+        "operator": "AND",
+        "builtInControls": ["mfa", "compliantDevice"]
+      }
+    },
+    "withLocationException": {
+      "description": "MFA obrigatório exceto quando na rede corporativa",
+      "conditions": {
+        "locations": {
+          "includeLocations": ["All"],
+          "excludeLocations": ["<CORPORATE-NETWORK-NAMED-LOCATION-ID>"]
+        }
+      },
+      "note": "Não recomendado: menos seguro, mas pode ser útil para transição"
+    },
+    "byDepartment": {
+      "description": "MFA para grupos específicos (rollout gradual)",
+      "conditions": {
+        "users": {
+          "includeGroups": [
+            "<DATA-ENGINEERING-GROUP-ID>",
+            "<DATA-SCIENCE-GROUP-ID>",
+            "<ANALYTICS-GROUP-ID>"
+          ]
+        }
+      }
+    },
+    "strictPolicy": {
+      "description": "Política estrita: MFA + Dispositivo + Rede confiável",
+      "conditions": {
+        "locations": {
+          "includeLocations": ["<APPROVED-LOCATIONS>"]
+        }
+      },
+      "grantControls": {
+        "operator": "AND",
+        "builtInControls": ["mfa", "compliantDevice"]
+      },
+      "sessionControls": {
+        "signInFrequency": {
+          "value": 4,
+          "type": "hours"
+        }
+      }
+    }
+  },
+  "troubleshooting": {
+    "policyNotApplying": [
+      "Verifique se state está 'enabled' ou 'enabledForReportingButNotEnforced'",
+      "Confirme que usuário não está em grupo de exclusão",
+      "Verifique se AppId está correto: 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d",
+      "Consulte logs: SigninLogs | where ConditionalAccessStatus"
+    ],
+    "userBlocked": [
+      "Verifique se usuário tem MFA registrado",
+      "Adicione temporariamente ao grupo de exclusão",
+      "Direcione usuário para: https://aka.ms/mfasetup"
+    ],
+    "performanceIssues": [
+      "Aumente signInFrequency de 8h para 24h",
+      "Habilite persistentBrowser.mode = 'always'",
+      "Considere excluir rede corporativa se apropriado"
+    ]
+  },
+  "complianceMapping": {
+    "frameworks": {
+      "ISO27001": "A.9.4.2 - Secure log-on procedures",
+      "NIST800-63B": "AAL2 - Multi-factor authentication required",
+      "PCIDSS": "8.3 - Multi-factor authentication for remote access",
+      "GDPR": "Article 32 - Security of processing",
+      "LGPD": "Art. 46 - Security measures",
+      "SOC2": "CC6.1 - Logical access controls"
+    }
+  },
+  "references": {
+    "documentation": [
+      "https://docs.microsoft.com/azure/active-directory/conditional-access/",
+      "https://docs.microsoft.com/azure/databricks/security/",
+      "https://github.com/nicdux/Databricks-tips-entra-mfa"
+    ],
+    "appIds": {
+      "AzureDatabricks": "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d",
+      "MicrosoftGraph": "00000003-0000-0000-c000-000000000000",
+      "OfficeOnline": "67e3df25-268a-4324-a550-0de1c7f97287"
+    }
+  }
+}
