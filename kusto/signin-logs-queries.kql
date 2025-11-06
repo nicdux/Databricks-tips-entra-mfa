@@ -1,0 +1,474 @@
+// ============================================================================
+// Consultas Kusto para Azure Databricks MFA - SigninLogs
+// ============================================================================
+// Estas consultas ajudam a auditar e monitorar autenticações MFA no Azure Databricks
+// Execute no Azure Log Analytics ou Microsoft Sentinel
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. CONSULTAS BÁSICAS
+// ----------------------------------------------------------------------------
+
+// 1.1 - Todos os logins no Databricks (últimos 7 dias)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| project TimeGenerated, UserPrincipalName, AppDisplayName, 
+          ResultType, ResultDescription, IPAddress, Location
+| order by TimeGenerated desc
+
+
+// 1.2 - Logins bem-sucedidos com MFA (últimas 24 horas)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(24h)
+| where ResultType == 0  // Sucesso
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| project TimeGenerated, UserPrincipalName, MfaDetail, IPAddress, DeviceDetail
+| order by TimeGenerated desc
+
+
+// 1.3 - Logins sem MFA (ALERTA - não deveria acontecer)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(24h)
+| where ResultType == 0  // Sucesso
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| project TimeGenerated, UserPrincipalName, AuthenticationRequirement, 
+          ConditionalAccessStatus, IPAddress, Location
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// 2. ANÁLISE DE COMPLIANCE MFA
+// ----------------------------------------------------------------------------
+
+// 2.1 - Taxa de compliance MFA (% de logins com MFA)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0  // Apenas sucessos
+| summarize 
+    TotalLogins = count(),
+    ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    SemMFA = countif(AuthenticationRequirement != "multiFactorAuthentication")
+| extend TaxaMFA = round((ComMFA * 100.0) / TotalLogins, 2)
+| project TotalLogins, ComMFA, SemMFA, TaxaMFA_Percentual = TaxaMFA
+
+
+// 2.2 - Compliance MFA por dia (tendência)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| summarize 
+    Total = count(),
+    ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication")
+    by bin(TimeGenerated, 1d)
+| extend TaxaMFA = round((ComMFA * 100.0) / Total, 2)
+| project TimeGenerated, Total, ComMFA, TaxaMFA_Percentual = TaxaMFA
+| render timechart
+
+
+// 2.3 - Compliance por usuário (identificar não-conformes)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| summarize 
+    Logins = count(),
+    ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    SemMFA = countif(AuthenticationRequirement != "multiFactorAuthentication")
+    by UserPrincipalName
+| extend TaxaMFA = round((ComMFA * 100.0) / Logins, 2)
+| where TaxaMFA < 100  // Apenas usuários não 100% compliance
+| order by SemMFA desc
+
+
+// ----------------------------------------------------------------------------
+// 3. ANÁLISE DE FALHAS MFA
+// ----------------------------------------------------------------------------
+
+// 3.1 - Todas as falhas de autenticação MFA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType != 0  // Falha
+| where ResultDescription contains "MFA" or ResultType in (50074, 50076, 50158)
+| project TimeGenerated, UserPrincipalName, ResultType, ResultDescription, 
+          IPAddress, Location, DeviceDetail
+| order by TimeGenerated desc
+
+
+// 3.2 - Top 10 usuários com mais falhas MFA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType in (50074, 50076)  // Códigos de erro MFA
+| summarize Falhas = count() by UserPrincipalName
+| top 10 by Falhas desc
+
+
+// 3.3 - Falhas MFA por código de erro
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType != 0
+| summarize Ocorrencias = count() by ResultType, ResultDescription
+| order by Ocorrencias desc
+
+
+// 3.4 - Taxa de falha por método MFA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| extend MfaMethod = tostring(parse_json(MfaDetail).authMethod)
+| where isnotempty(MfaMethod)
+| summarize 
+    Total = count(),
+    Sucessos = countif(ResultType == 0),
+    Falhas = countif(ResultType != 0)
+    by MfaMethod
+| extend TaxaSucesso = round((Sucessos * 100.0) / Total, 2)
+| order by Total desc
+
+
+// ----------------------------------------------------------------------------
+// 4. ANÁLISE DE ACESSO CONDICIONAL
+// ----------------------------------------------------------------------------
+
+// 4.1 - Status de políticas de Acesso Condicional aplicadas
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(24h)
+| mv-expand ConditionalAccessPolicies
+| extend 
+    PolicyName = tostring(ConditionalAccessPolicies.displayName),
+    PolicyResult = tostring(ConditionalAccessPolicies.result)
+| where isnotempty(PolicyName)
+| summarize Aplicacoes = count() by PolicyName, PolicyResult
+| order by Aplicacoes desc
+
+
+// 4.2 - Logins onde política CA falhou
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| mv-expand ConditionalAccessPolicies
+| extend 
+    PolicyName = tostring(ConditionalAccessPolicies.displayName),
+    PolicyResult = tostring(ConditionalAccessPolicies.result)
+| where PolicyResult == "failure"
+| project TimeGenerated, UserPrincipalName, PolicyName, PolicyResult, ResultType, ResultDescription
+| order by TimeGenerated desc
+
+
+// 4.3 - Análise detalhada de uma política específica
+let policyName = "MFA-Obrigatório-Azure-Databricks";  // Ajuste o nome
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| mv-expand ConditionalAccessPolicies
+| extend 
+    PolicyName = tostring(ConditionalAccessPolicies.displayName),
+    PolicyResult = tostring(ConditionalAccessPolicies.result)
+| where PolicyName == policyName
+| summarize 
+    Total = count(),
+    Success = countif(PolicyResult == "success"),
+    Failure = countif(PolicyResult == "failure"),
+    NotApplied = countif(PolicyResult == "notApplied")
+    by bin(TimeGenerated, 1h)
+| render timechart
+
+
+// ----------------------------------------------------------------------------
+// 5. ANÁLISE DE MÉTODOS MFA
+// ----------------------------------------------------------------------------
+
+// 5.1 - Distribuição de métodos MFA utilizados
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend MfaMethod = tostring(parse_json(MfaDetail).authMethod)
+| summarize Utilizacoes = count() by MfaMethod
+| order by Utilizacoes desc
+| render piechart
+
+
+// 5.2 - Métodos MFA por usuário
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend MfaMethod = tostring(parse_json(MfaDetail).authMethod)
+| summarize MetodosUtilizados = make_set(MfaMethod), Logins = count() 
+    by UserPrincipalName
+| order by Logins desc
+
+
+// 5.3 - Tendência de uso de métodos MFA ao longo do tempo
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend MfaMethod = tostring(parse_json(MfaDetail).authMethod)
+| summarize Utilizacoes = count() by MfaMethod, bin(TimeGenerated, 1d)
+| render timechart
+
+
+// ----------------------------------------------------------------------------
+// 6. ANÁLISE GEOGRÁFICA E DE DISPOSITIVOS
+// ----------------------------------------------------------------------------
+
+// 6.1 - Logins MFA por localização geográfica
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| summarize Logins = count() by Location
+| order by Logins desc
+
+
+// 6.2 - Logins de localizações incomuns (fora do Brasil, por exemplo)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where Location !contains "Brazil" and Location !contains "BR"
+| project TimeGenerated, UserPrincipalName, Location, IPAddress, 
+          AuthenticationRequirement, MfaDetail
+| order by TimeGenerated desc
+
+
+// 6.3 - Tipos de dispositivos utilizados
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| extend DeviceOS = tostring(parse_json(DeviceDetail).operatingSystem)
+| summarize Logins = count() by DeviceOS
+| order by Logins desc
+| render piechart
+
+
+// 6.4 - Logins de dispositivos não gerenciados (potencial risco)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| extend 
+    IsCompliant = tostring(parse_json(DeviceDetail).isCompliant),
+    IsManaged = tostring(parse_json(DeviceDetail).isManaged)
+| where IsCompliant != "true" or IsManaged != "true"
+| project TimeGenerated, UserPrincipalName, IsCompliant, IsManaged, 
+          DeviceDetail, IPAddress, Location
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// 7. ANÁLISE DE PADRÕES E ANOMALIAS
+// ----------------------------------------------------------------------------
+
+// 7.1 - Usuários com logins em múltiplas localizações no mesmo dia
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(1d)
+| where ResultType == 0
+| summarize Localizacoes = dcount(Location), Detalhes = make_set(Location) 
+    by UserPrincipalName, bin(TimeGenerated, 1d)
+| where Localizacoes > 1
+| order by Localizacoes desc
+
+
+// 7.2 - Horários de pico de acesso
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| extend Hour = hourofday(TimeGenerated)
+| summarize Logins = count() by Hour
+| order by Hour asc
+| render columnchart
+
+
+// 7.3 - Identificar tentativas de login após horas (possível atividade suspeita)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| extend Hour = hourofday(TimeGenerated)
+| where Hour < 6 or Hour > 22  // Fora do horário comercial
+| project TimeGenerated, UserPrincipalName, Hour, Location, IPAddress, 
+          ResultType, AuthenticationRequirement
+| order by TimeGenerated desc
+
+
+// 7.4 - Logins de IPs novos/incomuns
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(1d)
+| where ResultType == 0
+| join kind=leftanti (
+    SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated between (ago(30d) .. ago(1d))
+    | distinct IPAddress
+) on IPAddress
+| project TimeGenerated, UserPrincipalName, IPAddress, Location, 
+          AuthenticationRequirement
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// 8. DASHBOARDS E RELATÓRIOS
+// ----------------------------------------------------------------------------
+
+// 8.1 - Dashboard executivo (KPIs principais)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| summarize 
+    TotalAcessos = count(),
+    UsuariosUnicos = dcount(UserPrincipalName),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication" and ResultType == 0),
+    FalhasMFA = countif(ResultType in (50074, 50076)),
+    LocalizacoesUnicas = dcount(Location)
+| extend 
+    TaxaMFA = round((AcessosComMFA * 100.0) / TotalAcessos, 2),
+    TaxaSucesso = round(((TotalAcessos - FalhasMFA) * 100.0) / TotalAcessos, 2)
+
+
+// 8.2 - Relatório de compliance semanal
+let inicio = startofweek(now());
+let fim = endofweek(now());
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated between (inicio .. fim)
+| where ResultType == 0
+| summarize 
+    TotalLogins = count(),
+    LoginsComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    UsuariosUnicos = dcount(UserPrincipalName)
+| extend 
+    TaxaCompliance = round((LoginsComMFA * 100.0) / TotalLogins, 2),
+    Semana = format_datetime(inicio, 'yyyy-MM-dd')
+| project Semana, TotalLogins, LoginsComMFA, UsuariosUnicos, TaxaCompliance_Percentual = TaxaCompliance
+
+
+// 8.3 - Top 20 usuários mais ativos
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| summarize 
+    Logins = count(),
+    ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    PrimeiroAcesso = min(TimeGenerated),
+    UltimoAcesso = max(TimeGenerated)
+    by UserPrincipalName
+| extend TaxaMFA = round((ComMFA * 100.0) / Logins, 2)
+| top 20 by Logins desc
+
+
+// ----------------------------------------------------------------------------
+// 9. ALERTAS E MONITORAMENTO
+// ----------------------------------------------------------------------------
+
+// 9.1 - ALERTA: Alto volume de falhas MFA (>10 em 1 hora)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(1h)
+| where ResultType in (50074, 50076)
+| summarize Falhas = count()
+| where Falhas > 10
+
+
+// 9.2 - ALERTA: Login sem MFA detectado (compliance violation)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(5m)
+| where ResultType == 0
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| project TimeGenerated, UserPrincipalName, IPAddress, Location, 
+          AlertType = "🚨 LOGIN SEM MFA DETECTADO"
+
+
+// 9.3 - ALERTA: Múltiplas falhas de MFA do mesmo usuário (possível ataque)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(1h)
+| where ResultType in (50074, 50076)
+| summarize Falhas = count() by UserPrincipalName
+| where Falhas >= 5
+| extend AlertType = "⚠️ MÚLTIPLAS FALHAS MFA - POSSÍVEL ATAQUE"
+
+
+// 9.4 - ALERTA: Login de localização de alto risco
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(15m)
+| where ResultType == 0
+| extend RiskLevel = tostring(RiskLevelDuringSignIn)
+| where RiskLevel in ("high", "medium")
+| project TimeGenerated, UserPrincipalName, RiskLevel, Location, IPAddress,
+          AlertType = "🔴 LOGIN DE LOCALIZAÇÃO DE RISCO"
+
+
+// ----------------------------------------------------------------------------
+// 10. CONSULTAS AVANÇADAS
+// ----------------------------------------------------------------------------
+
+// 10.1 - Análise de sessão: Tempo entre MFA e expiração
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend SessionLifetime = tostring(SessionLifetimePolicies)
+| project TimeGenerated, UserPrincipalName, SessionLifetime
+| order by TimeGenerated desc
+
+
+// 10.2 - Análise de autenticação legada (deve ser zero)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ClientAppUsed !in ("Browser", "Mobile Apps and Desktop clients")
+| project TimeGenerated, UserPrincipalName, ClientAppUsed, ResultType,
+          AlertType = "⚠️ AUTENTICAÇÃO LEGADA DETECTADA"
+| order by TimeGenerated desc
+
+
+// 10.3 - Correlação: Falhas MFA seguidas de sucesso (possível MFA fatigue)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(24h)
+| where ResultType in (0, 50076)
+| order by UserPrincipalName, TimeGenerated asc
+| extend 
+    PrevResult = prev(ResultType, 1),
+    PrevUser = prev(UserPrincipalName, 1)
+| where UserPrincipalName == PrevUser and PrevResult == 50076 and ResultType == 0
+| project TimeGenerated, UserPrincipalName, 
+          Observacao = "Falha MFA seguida de sucesso - possível fadiga"
+
+
+// ============================================================================
+// NOTAS DE USO
+// ============================================================================
+// 
+// 1. Ajuste os períodos (ago(7d), ago(24h), etc.) conforme necessário
+// 2. Substitua "Databricks" pelo nome exato da sua aplicação se diferente
+// 3. Para alertas, configure no Azure Monitor com as queries da seção 9
+// 4. KPIs recomendados para dashboard:
+//    - Taxa de compliance MFA (meta: 100%)
+//    - Taxa de sucesso de login (meta: >95%)
+//    - Tempo médio de autenticação (meta: <30s)
+//    - Falhas MFA por hora (meta: <5)
+// 
+// ============================================================================

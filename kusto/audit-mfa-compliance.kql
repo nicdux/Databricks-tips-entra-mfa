@@ -1,0 +1,550 @@
+// ============================================================================
+// Consultas Kusto para Auditoria de Compliance MFA - Azure Databricks
+// ============================================================================
+// Estas consultas focam especificamente em verificar e reportar compliance
+// com políticas de MFA obrigatório
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. RELATÓRIOS DE COMPLIANCE
+// ----------------------------------------------------------------------------
+
+// 1.1 - Relatório Executivo de Compliance (últimos 30 dias)
+let periodo = 30d;
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(periodo)
+| where ResultType == 0  // Apenas sucessos
+| summarize 
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    AcessosSemMFA = countif(AuthenticationRequirement != "multiFactorAuthentication"),
+    UsuariosUnicos = dcount(UserPrincipalName),
+    DiasComAcesso = dcount(format_datetime(TimeGenerated, 'yyyy-MM-dd'))
+| extend 
+    TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2),
+    MediaAcessosDia = round(TotalAcessos * 1.0 / DiasComAcesso, 0)
+| project 
+    Periodo = strcat("Últimos ", periodo),
+    TotalAcessos,
+    AcessosComMFA,
+    AcessosSemMFA,
+    TaxaCompliance_Percentual = TaxaCompliance,
+    UsuariosUnicos,
+    MediaAcessosPorDia = MediaAcessosDia,
+    Status = case(
+        TaxaCompliance == 100, "✅ COMPLETO",
+        TaxaCompliance >= 95, "⚠️ QUASE COMPLETO",
+        "❌ NÃO CONFORME"
+    )
+
+
+// 1.2 - Compliance por Semana (tendência)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(90d)
+| where ResultType == 0
+| extend Semana = startofweek(TimeGenerated)
+| summarize 
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    UsuariosAtivos = dcount(UserPrincipalName)
+    by Semana
+| extend TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2)
+| project 
+    Semana = format_datetime(Semana, 'yyyy-MM-dd'),
+    TotalAcessos,
+    AcessosComMFA,
+    UsuariosAtivos,
+    TaxaCompliance_Percentual = TaxaCompliance
+| order by Semana desc
+
+
+// 1.3 - Compliance por Mês (para relatórios mensais)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(365d)
+| where ResultType == 0
+| extend Mes = startofmonth(TimeGenerated)
+| summarize 
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    UsuariosAtivos = dcount(UserPrincipalName)
+    by Mes
+| extend TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2)
+| project 
+    Mes = format_datetime(Mes, 'yyyy-MM'),
+    TotalAcessos,
+    AcessosComMFA,
+    UsuariosAtivos,
+    TaxaCompliance_Percentual = TaxaCompliance
+| order by Mes desc
+
+
+// ----------------------------------------------------------------------------
+// 2. IDENTIFICAÇÃO DE NÃO-CONFORMIDADES
+// ----------------------------------------------------------------------------
+
+// 2.1 - Usuários com acessos SEM MFA (CRÍTICO)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| summarize 
+    AcessosSemMFA = count(),
+    PrimeiroAcesso = min(TimeGenerated),
+    UltimoAcesso = max(TimeGenerated),
+    Localizacoes = make_set(Location),
+    IPAddresses = make_set(IPAddress)
+    by UserPrincipalName
+| extend 
+    RiscoNivel = case(
+        AcessosSemMFA > 10, "🔴 ALTO",
+        AcessosSemMFA > 5, "🟡 MÉDIO",
+        "🟢 BAIXO"
+    )
+| order by AcessosSemMFA desc
+
+
+// 2.2 - Detalhes de cada acesso sem MFA (para investigação)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Location,
+    DeviceDetail = tostring(DeviceDetail),
+    ConditionalAccessStatus,
+    Politicas = tostring(ConditionalAccessPolicies)
+| order by TimeGenerated desc
+
+
+// 2.3 - Usuários que NUNCA usaram MFA no período
+let usuariosComMFA = SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated > ago(30d)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | distinct UserPrincipalName;
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| distinct UserPrincipalName
+| join kind=leftanti usuariosComMFA on UserPrincipalName
+| project UserPrincipalName, Status = "❌ NUNCA USOU MFA"
+
+
+// 2.4 - Políticas CA que falharam em aplicar MFA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| mv-expand ConditionalAccessPolicies
+| extend 
+    PolicyName = tostring(ConditionalAccessPolicies.displayName),
+    PolicyResult = tostring(ConditionalAccessPolicies.result)
+| summarize 
+    Ocorrencias = count(),
+    UsuariosAfetados = dcount(UserPrincipalName),
+    Exemplos = make_set(UserPrincipalName, 5)
+    by PolicyName, PolicyResult
+| order by Ocorrencias desc
+
+
+// ----------------------------------------------------------------------------
+// 3. ANÁLISE POR DEPARTAMENTO/GRUPO
+// ----------------------------------------------------------------------------
+
+// 3.1 - Compliance por domínio de email (proxy para departamento)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| extend Dominio = split(UserPrincipalName, "@")[1]
+| summarize 
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    Usuarios = dcount(UserPrincipalName)
+    by Dominio
+| extend TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2)
+| project 
+    Dominio,
+    Usuarios,
+    TotalAcessos,
+    AcessosComMFA,
+    TaxaCompliance_Percentual = TaxaCompliance,
+    Status = case(
+        TaxaCompliance == 100, "✅",
+        TaxaCompliance >= 95, "⚠️",
+        "❌"
+    )
+| order by TaxaCompliance asc
+
+
+// 3.2 - Top usuários não-conformes (por volume)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| summarize 
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    AcessosSemMFA = countif(AuthenticationRequirement != "multiFactorAuthentication")
+    by UserPrincipalName
+| where AcessosSemMFA > 0
+| extend 
+    TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2),
+    TaxaNaoCompliance = round((AcessosSemMFA * 100.0) / TotalAcessos, 2)
+| top 20 by AcessosSemMFA desc
+| project 
+    UserPrincipalName,
+    TotalAcessos,
+    AcessosSemMFA,
+    TaxaNaoCompliance_Percentual = TaxaNaoCompliance
+
+
+// ----------------------------------------------------------------------------
+// 4. MÉTRICAS DE SUCESSO MFA
+// ----------------------------------------------------------------------------
+
+// 4.1 - Taxa de sucesso na primeira tentativa MFA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| extend IsFirstAttempt = ResultType == 0
+| summarize 
+    TotalTentativas = count(),
+    PrimeirasSucessos = countif(IsFirstAttempt),
+    Falhas = countif(ResultType != 0)
+| extend TaxaSucessoPrimeiraVez = round((PrimeirasSucessos * 100.0) / TotalTentativas, 2)
+
+
+// 4.2 - Tempo médio para completar MFA (estimado)
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| summarize 
+    TempoMedio_ms = avg(todouble(DurationMs)),
+    TempoMediano_ms = percentile(todouble(DurationMs), 50),
+    P95_ms = percentile(todouble(DurationMs), 95)
+| extend 
+    TempoMedio_seg = round(TempoMedio_ms / 1000, 1),
+    TempoMediano_seg = round(TempoMediano_ms / 1000, 1),
+    P95_seg = round(P95_ms / 1000, 1)
+
+
+// 4.3 - Distribuição de tentativas MFA até sucesso
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where AuthenticationRequirement == "multiFactorAuthentication"
+| summarize TentativasAteSucesso = countif(ResultType != 0) + 1 
+    by UserPrincipalName, bin(TimeGenerated, 5m)
+| summarize Ocorrencias = count() by TentativasAteSucesso
+| order by TentativasAteSucesso asc
+
+
+// ----------------------------------------------------------------------------
+// 5. AUDITORIA DE EXCEÇÕES
+// ----------------------------------------------------------------------------
+
+// 5.1 - Usuários em grupo de exceção (se aplicável)
+// Nota: Esta query precisa ser ajustada com o nome do grupo de exceção
+let grupoExcecao = "CA-Emergency-Exclusion";
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| where AuthenticationRequirement != "multiFactorAuthentication"
+| summarize 
+    AcessosSemMFA = count(),
+    PrimeiroAcesso = min(TimeGenerated),
+    UltimoAcesso = max(TimeGenerated)
+    by UserPrincipalName
+| extend 
+    PossivelExcecao = "⚠️ Verificar se está em grupo de exceção"
+| order by AcessosSemMFA desc
+
+
+// 5.2 - Histórico de uso de conta break-glass
+let breakGlassAccounts = dynamic(["breakglass@contoso.com", "emergencia@contoso.com"]);
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(90d)
+| where UserPrincipalName in (breakGlassAccounts)
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    ResultType,
+    IPAddress,
+    Location,
+    Alerta = "🚨 USO DE CONTA BREAK-GLASS DETECTADO"
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// 6. RELATÓRIOS PARA GESTÃO
+// ----------------------------------------------------------------------------
+
+// 6.1 - Scorecard de Compliance (formato executivo)
+let periodo = 30d;
+let total = toscalar(
+    SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated > ago(periodo)
+    | where ResultType == 0
+    | count
+);
+let comMFA = toscalar(
+    SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated > ago(periodo)
+    | where ResultType == 0
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | count
+);
+print 
+    Metrica = "Taxa de Compliance MFA",
+    Valor = round((comMFA * 100.0) / total, 2),
+    Unidade = "%",
+    Meta = 100,
+    Status = case(
+        (comMFA * 100.0 / total) >= 100, "✅ Atingiu meta",
+        (comMFA * 100.0 / total) >= 95, "⚠️ Próximo da meta",
+        "❌ Abaixo da meta"
+    )
+
+
+// 6.2 - Resumo para reunião semanal
+let semana = startofweek(now());
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated >= semana
+| where ResultType == 0
+| summarize 
+    TotalAcessos = count(),
+    UsuariosAtivos = dcount(UserPrincipalName),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    FalhasMFA = countif(ResultType in (50074, 50076)),
+    LocalizacoesUnicas = dcount(Location)
+| extend 
+    TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2),
+    AcessosPorUsuario = round(TotalAcessos * 1.0 / UsuariosAtivos, 1)
+| project 
+    Semana = format_datetime(semana, 'yyyy-MM-dd'),
+    UsuariosAtivos,
+    TotalAcessos,
+    AcessosPorUsuario,
+    TaxaCompliance_Percentual = TaxaCompliance,
+    FalhasMFA,
+    LocalizacoesUnicas
+
+
+// 6.3 - Evolução mensal de KPIs
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(365d)
+| where ResultType == 0
+| extend Mes = startofmonth(TimeGenerated)
+| summarize 
+    Acessos = count(),
+    Usuarios = dcount(UserPrincipalName),
+    ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    FalhasMFA = countif(ResultType in (50074, 50076))
+    by Mes
+| extend 
+    TaxaCompliance = round((ComMFA * 100.0) / Acessos, 2),
+    AcessosPorUsuario = round(Acessos * 1.0 / Usuarios, 1)
+| project 
+    Mes = format_datetime(Mes, 'yyyy-MM'),
+    Usuarios,
+    Acessos,
+    TaxaCompliance_Percentual = TaxaCompliance,
+    FalhasMFA,
+    AcessosPorUsuario
+| order by Mes desc
+
+
+// ----------------------------------------------------------------------------
+// 7. VERIFICAÇÃO DE POLÍTICAS
+// ----------------------------------------------------------------------------
+
+// 7.1 - Efetividade de cada política CA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| mv-expand ConditionalAccessPolicies
+| extend 
+    PolicyName = tostring(ConditionalAccessPolicies.displayName),
+    PolicyResult = tostring(ConditionalAccessPolicies.result),
+    GrantControls = tostring(ConditionalAccessPolicies.enforcedGrantControls)
+| where isnotempty(PolicyName)
+| summarize 
+    Aplicacoes = count(),
+    Sucessos = countif(PolicyResult == "success"),
+    Falhas = countif(PolicyResult == "failure"),
+    NaoAplicado = countif(PolicyResult == "notApplied"),
+    UsuariosAfetados = dcount(UserPrincipalName)
+    by PolicyName, GrantControls
+| extend TaxaSucesso = round((Sucessos * 100.0) / Aplicacoes, 2)
+| order by Aplicacoes desc
+
+
+// 7.2 - Gaps de cobertura de política
+// Identifica logins que não foram avaliados por nenhuma política CA
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(24h)
+| where ResultType == 0
+| extend HasCA = array_length(ConditionalAccessPolicies) > 0
+| where HasCA == false
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Location,
+    Alerta = "⚠️ LOGIN SEM AVALIAÇÃO DE POLÍTICA CA"
+| order by TimeGenerated desc
+
+
+// ----------------------------------------------------------------------------
+// 8. EXPORTAÇÃO PARA COMPLIANCE REPORTS
+// ----------------------------------------------------------------------------
+
+// 8.1 - Export format para auditoria externa
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(30d)
+| where ResultType == 0
+| project 
+    Data = format_datetime(TimeGenerated, 'yyyy-MM-dd HH:mm:ss'),
+    Usuario = UserPrincipalName,
+    Aplicacao = AppDisplayName,
+    MFA_Requerido = case(
+        AuthenticationRequirement == "multiFactorAuthentication", "SIM",
+        "NÃO"
+    ),
+    Metodo_MFA = tostring(parse_json(MfaDetail).authMethod),
+    Status = case(ResultType == 0, "Sucesso", "Falha"),
+    IP = IPAddress,
+    Localizacao = Location,
+    Dispositivo = tostring(parse_json(DeviceDetail).displayName)
+| order by Data desc
+
+
+// 8.2 - Resumo de compliance para ISO 27001
+let periodo = 90d;
+SigninLogs
+| where AppDisplayName contains "Databricks"
+| where TimeGenerated > ago(periodo)
+| where ResultType == 0
+| summarize 
+    ControleID = "A.9.4.2",
+    ControleNome = "Secure log-on procedures",
+    TotalAcessos = count(),
+    AcessosComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+    UsuariosAtivos = dcount(UserPrincipalName)
+| extend 
+    TaxaCompliance = round((AcessosComMFA * 100.0) / TotalAcessos, 2),
+    StatusCompliance = case(
+        (AcessosComMFA * 100.0 / TotalAcessos) >= 100, "CONFORME",
+        (AcessosComMFA * 100.0 / TotalAcessos) >= 95, "PARCIALMENTE CONFORME",
+        "NÃO CONFORME"
+    ),
+    Periodo = strcat("Últimos ", periodo),
+    DataAvaliacao = now()
+| project 
+    DataAvaliacao,
+    Periodo,
+    ControleID,
+    ControleNome,
+    TotalAcessos,
+    AcessosComMFA,
+    UsuariosAtivos,
+    TaxaCompliance_Percentual = TaxaCompliance,
+    StatusCompliance
+
+
+// ----------------------------------------------------------------------------
+// 9. ALERTAS DE COMPLIANCE CRÍTICOS
+// ----------------------------------------------------------------------------
+
+// 9.1 - ALERTA: Compliance caiu abaixo de 95%
+let compliance = toscalar(
+    SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated > ago(24h)
+    | where ResultType == 0
+    | summarize 
+        ComMFA = countif(AuthenticationRequirement == "multiFactorAuthentication"),
+        Total = count()
+    | extend Taxa = (ComMFA * 100.0) / Total
+    | project Taxa
+);
+print 
+    Alerta = "🚨 COMPLIANCE CRÍTICO",
+    TaxaAtual = compliance,
+    Meta = 95.0,
+    Status = case(
+        compliance < 95.0, "❌ ABAIXO DA META - AÇÃO IMEDIATA NECESSÁRIA",
+        "✅ OK"
+    )
+| where compliance < 95.0
+
+
+// 9.2 - ALERTA: Aumento súbito de acessos sem MFA
+let hoje = SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated > ago(1d)
+    | where ResultType == 0
+    | where AuthenticationRequirement != "multiFactorAuthentication"
+    | count;
+let ontem = SigninLogs
+    | where AppDisplayName contains "Databricks"
+    | where TimeGenerated between (ago(2d) .. ago(1d))
+    | where ResultType == 0
+    | where AuthenticationRequirement != "multiFactorAuthentication"
+    | count;
+print 
+    AcessosSemMFA_Hoje = hoje,
+    AcessosSemMFA_Ontem = ontem,
+    Variacao = hoje - ontem,
+    VariacaoPercentual = round(((hoje - ontem) * 100.0) / ontem, 2),
+    Alerta = case(
+        hoje > (ontem * 1.5), "🚨 AUMENTO ANORMAL - INVESTIGAR",
+        "✅ Normal"
+    )
+| where hoje > (ontem * 1.5)
+
+
+// ============================================================================
+// CONFIGURAÇÕES RECOMENDADAS PARA ALERTAS
+// ============================================================================
+// 
+// Configurar no Azure Monitor com as seguintes frequências:
+// 
+// Alertas Críticos (verificar a cada 5 minutos):
+// - 9.1: Compliance < 95%
+// - 9.2: Aumento súbito de acessos sem MFA
+// 
+// Alertas Importantes (verificar a cada hora):
+// - 2.1: Novos usuários com acesso sem MFA
+// - 7.2: Logins sem avaliação CA
+// 
+// Relatórios (agendados):
+// - 6.2: Resumo semanal (segunda-feira 9h)
+// - 6.3: Evolução mensal (primeiro dia do mês 9h)
+// - 8.2: Compliance ISO (mensal)
+//
+// ============================================================================
