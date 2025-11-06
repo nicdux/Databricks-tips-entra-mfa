@@ -380,6 +380,19 @@ Este checklist abrangente cobre todos os aspectos de segurança para uma impleme
 
 ## Scorecard de Segurança
 
+### Como Calcular o Score
+
+**Fórmula por categoria:**
+```
+Score = (Completo × 100 + Parcial × 50) / Total de Itens
+```
+
+**Exemplo:** Categoria com 10 itens:
+- 7 Completos: 7 × 100 = 700
+- 2 Parciais: 2 × 50 = 100
+- 1 Não Iniciado: 1 × 0 = 0
+- Score: (700 + 100) / 10 = 80%
+
 ### Resumo por Categoria
 
 | Categoria | Completo | Parcial | Não Iniciado | Score |

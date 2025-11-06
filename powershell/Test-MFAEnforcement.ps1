@@ -214,8 +214,8 @@ if ($loginsSemMFA -gt 0) {
     Write-Host "   2. Verificar AppId na política" -ForegroundColor White
     Write-Host "      - AppId deve ser: 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "   3. Executar script de diagnóstico" -ForegroundColor White
-    Write-Host "      - .\troubleshooting\Diagnose-DatabricksMFA.ps1" -ForegroundColor Gray
+    Write-Host "   3. Consultar guia de troubleshooting" -ForegroundColor White
+    Write-Host "      - Ver: docs/troubleshooting.md no repositório" -ForegroundColor Gray
     Write-Host ""
 }
 

@@ -210,6 +210,8 @@ $params = @{
     SecurityEnabled = $true
     MailNickname = "databricks-users-dyn"
     GroupTypes = @("DynamicMembership")
+    # Nota: Substitua "databricks-service-plan-id" pelo Service Plan ID real
+    # Para encontrar: Get-MgSubscribedSku | Where-Object {$_.SkuPartNumber -like "*Databricks*"} | Select-Object -ExpandProperty ServicePlans
     MembershipRule = '(user.assignedLicenses -any (x:x.servicePlanId -eq "databricks-service-plan-id"))'
     MembershipRuleProcessingState = "On"
 }
